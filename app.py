@@ -327,6 +327,44 @@ def fetch_candles_from_bitfinex(symbol, interval, limit=None):
         print(f"⚠️ Bitfinex fetch failed for {symbol} [{interval}]: {exc}")
         return pd.DataFrame()
 
+def fetch_bitfinex_trade_history(symbol, limit=10000):
+    """Fetch signed public trade prints; this is venue-specific, not consolidated flow."""
+    pair = BITFINEX_SYMBOLS.get(symbol)
+    if not pair:
+        return pd.DataFrame(columns=['signed_amount', 'price'])
+    try:
+        response = requests.get(
+            f'https://api-pub.bitfinex.com/v2/trades/{pair}/hist',
+            params={'limit': min(10000, max(1, int(limit)))},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list):
+            return pd.DataFrame(columns=['signed_amount', 'price'])
+        trades = []
+        for item in payload:
+            if not isinstance(item, list) or len(item) < 4:
+                continue
+            try:
+                timestamp_ms, signed_amount, price = int(item[1]), float(item[2]), float(item[3])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if timestamp_ms > 0 and signed_amount != 0 and price > 0:
+                trades.append({
+                    'timestamp_ms': timestamp_ms,
+                    'signed_amount': signed_amount,
+                    'price': price,
+                })
+        if not trades:
+            return pd.DataFrame(columns=['signed_amount', 'price'])
+        frame = pd.DataFrame(trades)
+        frame.index = pd.to_datetime(frame.pop('timestamp_ms'), unit='ms', utc=True)
+        return frame.sort_index()
+    except Exception as exc:
+        print(f"⚠️ Bitfinex public trade history failed for {symbol}: {exc}")
+        return pd.DataFrame(columns=['signed_amount', 'price'])
+
 def fetch_latest_bitfinex_trade(symbol):
     pair = BITFINEX_SYMBOLS.get(symbol)
     if not pair:
@@ -417,18 +455,14 @@ def fetch_symbol_data(symbol, yf_symbol):
             preferred_provider = frame.attrs.get('market_data_provider')
         return frame
 
+    df_m5 = pd.DataFrame()
     df_m10 = pd.DataFrame()
-    # True M10 = two 5m bars (the old code asked Yahoo for '10m', which doesn't exist, and
-    # silently fell back to M15 while still calling it M10).
+    # Build true M10 bars from M5; never relabel M15/M30/H1 data as M10.
     df5 = fetch('5m', '5d')
-    if df5 is not None and not df5.empty and len(df5) >= 60:
+    if df5 is not None and not df5.empty:
+        df_m5 = df5
+    if df5 is not None and not df5.empty and len(df5) >= 2:
         df_m10 = resample_ohlcv(df5, '10min')
-    if df_m10.empty:
-        for interval, period in [('15m', '5d'), ('30m', '5d'), ('60m', '5d')]:
-            df_candidate = fetch(interval, period)
-            if not df_candidate.empty:
-                df_m10 = df_candidate
-                break
     df_m15 = pd.DataFrame()
     for interval, period in [('15m', '5d'), ('30m', '5d')]:
         df_candidate = fetch(interval, period)
@@ -448,11 +482,11 @@ def fetch_symbol_data(symbol, yf_symbol):
     if df_h4.empty:
         df_h4 = fetch('1d', '6mo')
     df_h4 = ensure_h4(df_h1, df_h4)
-    if df_m10.empty and not df_m15.empty:
-        df_m10 = df_m15
-    if df_m30.empty and not df_h1.empty:
-        df_m30 = df_h1
-    return {'M10': df_m10, 'M15': df_m15, 'M30': df_m30, 'H1': df_h1, 'H4': df_h4}
+    trade_flow = fetch_bitfinex_trade_history(symbol) if preferred_provider == 'bitfinex' else pd.DataFrame(columns=['signed_amount', 'price'])
+    return {
+        'M5': df_m5, 'M10': df_m10, 'M15': df_m15, 'M30': df_m30,
+        'H1': df_h1, 'H4': df_h4, 'TRADE_FLOW': trade_flow,
+    }
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_all_data():
@@ -736,6 +770,18 @@ def align_candle_frames_to_spot_reference(data, market_snapshot):
         return data
     aligned = {}
     for timeframe, frame in data.items():
+        if timeframe == 'TRADE_FLOW':
+            if isinstance(frame, pd.DataFrame):
+                adjusted_trades = frame.copy()
+                if 'price' in adjusted_trades.columns:
+                    adjusted_trades['price'] = pd.to_numeric(adjusted_trades['price'], errors='coerce') + float(adjustment)
+                aligned[timeframe] = adjusted_trades
+            else:
+                aligned[timeframe] = [
+                    {**trade, 'price': float(trade['price']) + float(adjustment)}
+                    for trade in (frame or [])
+                ]
+            continue
         if frame is None or frame.empty:
             aligned[timeframe] = frame
             continue
@@ -1394,9 +1440,32 @@ def calculate_volume_analysis(df, lookback=120, profile_bins=24):
             return unavailable
         bins = min(profile_bins, max(8, int(np.sqrt(len(volume)) * 2)))
         edges = np.linspace(price_low, price_high, bins + 1)
-        volume_by_price, _ = np.histogram(typical_price, bins=edges, weights=volume)
+        overlaps = np.maximum(
+            0.0,
+            np.minimum(high[:, None], edges[1:]) - np.maximum(low[:, None], edges[:-1]),
+        )
+        ranges = high - low
+        allocations = np.divide(
+            overlaps, ranges[:, None], out=np.zeros_like(overlaps), where=ranges[:, None] > 0
+        )
+        flat_bars = ranges <= 0
+        if flat_bars.any():
+            flat_volume, _ = np.histogram(typical_price[flat_bars], bins=edges, weights=volume[flat_bars])
+            allocations[flat_bars] = 0.0
+        else:
+            flat_volume = np.zeros(len(edges) - 1, dtype=float)
+        volume_by_price = np.sum(allocations * volume[:, None], axis=0) + flat_volume
         centers = (edges[:-1] + edges[1:]) / 2.0
         poc_idx = int(np.argmax(volume_by_price))
+        positive_profile = volume_by_price[volume_by_price > 0]
+        hvn_threshold = float(np.median(positive_profile) * 1.5) if len(positive_profile) else 0.0
+        hvn_indices = [
+            idx for idx, value in enumerate(volume_by_price)
+            if value >= hvn_threshold and value > 0
+            and value >= (volume_by_price[idx - 1] if idx > 0 else -1)
+            and value >= (volume_by_price[idx + 1] if idx < len(volume_by_price) - 1 else -1)
+        ]
+        hvn_indices = sorted(hvn_indices, key=lambda idx: volume_by_price[idx], reverse=True)[:3]
         value_area_left = value_area_right = poc_idx
         value_area_volume = float(volume_by_price[poc_idx])
         target_volume = float(volume_by_price.sum()) * 0.70
@@ -1427,8 +1496,103 @@ def calculate_volume_analysis(df, lookback=120, profile_bins=24):
                 'vah': float(edges[value_area_right + 1]),
                 'bin_width': float(edges[1] - edges[0]),
                 'lookback_bars': len(volume),
+                'method': 'uniform candle-range allocation estimate',
+                'hvn_levels': [
+                    {'price': float(centers[idx]), 'volume_share_pct': round(100.0 * float(volume_by_price[idx]) / float(volume_by_price.sum()), 1)}
+                    for idx in sorted(hvn_indices)
+                ],
             },
             'source': 'OHLCV close-location proxy; no bid/ask trade data',
+        }
+    except Exception:
+        return unavailable
+
+def calculate_trade_delta_analysis(trades, df, zone=None, lookback_bars=20):
+    """Summarize signed Bitfinex prints only where candle-time coverage is observable."""
+    unavailable = {
+        'available': False, 'delta_pct': None, 'signed_volume': None,
+        'total_volume': None, 'trade_count': 0, 'covered_bars': 0,
+        'source': 'unavailable; no signed public trade feed for this instrument',
+    }
+    if trades is None or df is None or df.empty:
+        return unavailable
+    if isinstance(trades, pd.DataFrame):
+        if trades.empty or not {'signed_amount', 'price'}.issubset(trades.columns):
+            return unavailable
+        trade_frame = trades
+        if not isinstance(trade_frame.index, pd.DatetimeIndex):
+            return unavailable
+    else:
+        if not trades:
+            return unavailable
+        try:
+            timestamps = pd.to_datetime(
+                [int(trade['timestamp_ms']) for trade in trades], unit='ms', utc=True
+            )
+            trade_frame = pd.DataFrame({
+                'signed_amount': [float(trade['signed_amount']) for trade in trades],
+                'price': [float(trade['price']) for trade in trades],
+            }, index=timestamps)
+        except Exception:
+            return unavailable
+    minutes = infer_bar_minutes(df)
+    d = closed_candles(df)
+    if not minutes or d is None or d.empty:
+        return unavailable
+    try:
+        if not trade_frame.index.is_monotonic_increasing:
+            trade_frame = trade_frame.sort_index()
+        interval = pd.Timedelta(minutes=minutes)
+        if zone is not None:
+            recent = d.tail(lookback_bars)
+            start, end = recent.index[0], recent.index[-1] + interval
+            bottom, top = sorted((float(zone['bottom']), float(zone['top'])))
+            in_window = (trade_frame.index >= start) & (trade_frame.index < end)
+            in_zone = trade_frame['price'].between(bottom, top, inclusive='both')
+            selected = trade_frame.loc[in_window & in_zone]
+            covered_bars = int(selected.index.floor(f'{minutes}min').nunique())
+            if len(selected) < 3 or covered_bars < 2:
+                return {**unavailable, 'source': 'insufficient signed trades inside this zone and lookback window'}
+            signed_volume = float(selected['signed_amount'].sum())
+            total_volume = float(selected['signed_amount'].abs().sum())
+            if total_volume <= 0:
+                return unavailable
+            return {
+                'available': True,
+                'delta_pct': round(100.0 * signed_volume / total_volume, 1),
+                'signed_volume': signed_volume,
+                'total_volume': total_volume,
+                'trade_count': int(len(selected)),
+                'covered_bars': covered_bars,
+                'window_start': start.isoformat(), 'window_end': end.isoformat(),
+                'source': 'Bitfinex signed public trades; single-venue delta',
+            }
+
+        earliest = trade_frame.index.min()
+        latest = trade_frame.index.max()
+        first_full_bar = earliest.ceil(f'{minutes}min')
+        last_full_bar = latest.floor(f'{minutes}min') - interval
+        starts = d.index[(d.index >= first_full_bar) & (d.index <= last_full_bar)][-lookback_bars:]
+        if len(starts) < 3:
+            return {**unavailable, 'source': 'insufficient Bitfinex trade-history time coverage for this interval'}
+        start, end = starts[0], starts[-1] + interval
+        selected = trade_frame.loc[(trade_frame.index >= start) & (trade_frame.index < end)]
+        covered_bars = int(selected.index.floor(f'{minutes}min').nunique())
+        if len(selected) < 3 or covered_bars < 3:
+            return {**unavailable, 'source': 'insufficient signed trades across completed bars'}
+        signed_volume = float(selected['signed_amount'].sum())
+        total_volume = float(selected['signed_amount'].abs().sum())
+        if total_volume <= 0:
+            return unavailable
+        return {
+            'available': True,
+            'delta_pct': round(100.0 * signed_volume / total_volume, 1),
+            'signed_volume': signed_volume,
+            'total_volume': total_volume,
+            'trade_count': int(len(selected)),
+            'covered_bars': covered_bars,
+            'window_start': start.isoformat(), 'window_end': end.isoformat(),
+            'source': 'Bitfinex signed public trades; single-venue delta',
         }
     except Exception:
         return unavailable
@@ -1461,6 +1625,9 @@ def score_volume_zone(snap, zone, direction, atr):
             return None
         close_location = np.divide(2 * (close - low), ranges, out=np.sign(close - open_price), where=ranges > 0) - np.where(ranges > 0, 1.0, 0.0)
         zone_delta_pct = 100.0 * float(np.sum(allocated_volume * np.clip(close_location, -1.0, 1.0))) / zone_volume
+        trade_delta = calculate_trade_delta_analysis(snap.get('trade_flow'), d, zone=zone)
+        if trade_delta.get('available'):
+            zone_delta_pct = float(trade_delta['delta_pct'])
         zone_body_pct = 100.0 * float(np.sum(allocated_volume * np.sign(close - open_price))) / zone_volume
         volume_share_pct = 100.0 * zone_volume / total_volume
         buy_volume_proxy_pct = float(np.clip((100.0 + zone_delta_pct) / 2.0, 0.0, 100.0))
@@ -1487,9 +1654,12 @@ def score_volume_zone(snap, zone, direction, atr):
 
         profile = analysis.get('profile') or {}
         poc, val, vah = profile.get('poc'), profile.get('val'), profile.get('vah')
+        hvn_levels = profile.get('hvn_levels') or []
         entry = float(zone.get('entry', (bottom + top) / 2.0))
         if poc is not None and bottom <= float(poc) <= top:
             profile_relation, profile_points = 'zone contains POC', 0.5
+        elif any(bottom <= float(node['price']) <= top for node in hvn_levels):
+            profile_relation, profile_points = 'zone contains estimated HVN', 0.375
         elif val is not None and vah is not None and bottom <= float(vah) and top >= float(val):
             profile_relation, profile_points = 'zone overlaps value area', 0.25
         elif poc is not None and atr and abs(entry - float(poc)) <= 0.5 * atr:
@@ -1517,12 +1687,19 @@ def score_volume_zone(snap, zone, direction, atr):
         return {
             'score': round(score, 1),
             'zone_delta_proxy_pct': round(zone_delta_pct, 1),
+            'zone_delta_is_exchange_reported': bool(trade_delta.get('available')),
+            'zone_delta_source': trade_delta.get('source') if trade_delta.get('available') else 'OHLCV close-location proxy',
+            'zone_trade_count': trade_delta.get('trade_count', 0),
             'zone_body_pressure_pct': round(zone_body_pct, 1),
             'zone_control': 'BUYERS' if zone_pressure >= 0.08 else 'SELLERS' if zone_pressure <= -0.08 else 'BALANCED',
             'buy_volume_proxy_pct': round(buy_volume_proxy_pct, 1),
             'sell_volume_proxy_pct': round(sell_volume_proxy_pct, 1),
             'net_volume_proxy_pct': round(zone_delta_pct, 1),
             'zone_volume_share_pct': round(volume_share_pct, 1),
+            'zone_volume_intensity': (
+                'HIGH' if volume_share_pct >= 20 and zone_rvol >= 1.0 else
+                'ELEVATED' if volume_share_pct >= 8 or zone_rvol >= 1.5 else 'NORMAL'
+            ),
             'zone_rvol': round(zone_rvol, 2),
             'directional_rejection_volume_pct': round(rejection_volume_pct, 1),
             'pullback_vs_impulse_volume_ratio': round(pullback_volume_ratio, 2) if pullback_volume_ratio is not None else None,
@@ -1535,6 +1712,7 @@ def score_volume_zone(snap, zone, direction, atr):
             'rvol': analysis.get('rvol'),
             'bar_minutes': analysis.get('bar_minutes'),
             'profile_relation': profile_relation,
+            'hvn_levels': hvn_levels,
             'poc': profile.get('poc'), 'val': profile.get('val'), 'vah': profile.get('vah'),
         }
     except Exception:
@@ -1542,7 +1720,7 @@ def score_volume_zone(snap, zone, direction, atr):
 
 def score_multi_timeframe_volume_zone(volume_frames, zone, direction, atr):
     """Compare zone evidence across M10/M15/M30/H1/H4; missing feeds are excluded, not guessed."""
-    timeframe_weights = {'M10': 0.75, 'M15': 1.0, 'M30': 1.25, 'H1': 1.5, 'H4': 1.5}
+    timeframe_weights = {'M5': 0.5, 'M10': 0.75, 'M15': 1.0, 'M30': 1.25, 'H1': 1.5, 'H4': 1.5}
     observations = {}
     duration_counts = {}
     for label, snap in volume_frames.items():
@@ -1604,12 +1782,19 @@ def score_multi_timeframe_volume_zone(volume_frames, zone, direction, atr):
         'opposing_timeframes': opposing_count,
         'unique_source_intervals': len(pressure_by_interval),
         'available_timeframes': list(observations),
+        'reported_trade_delta_intervals': sum(
+            bool(item.get('zone_delta_is_exchange_reported')) for item in observations.values()
+        ),
         'net_volume_proxy_pct': round(net_volume_proxy_pct, 1),
         'buy_volume_proxy_pct': round(buy_volume_proxy_pct, 1),
         'sell_volume_proxy_pct': round(sell_volume_proxy_pct, 1),
         'volume_pressure': ('BUYERS' if net_volume_proxy_pct >= 8 else
                             'SELLERS' if net_volume_proxy_pct <= -8 else 'BALANCED'),
-        'volume_pressure_basis': 'OHLCV close-location estimate; not actual aggressor-side volume',
+        'volume_pressure_basis': (
+            'mixed venue-specific signed trade delta and OHLCV close-location estimates; not consolidated flow'
+            if any(item.get('zone_delta_is_exchange_reported') for item in observations.values())
+            else 'OHLCV close-location estimate; not actual aggressor-side volume'
+        ),
     }
     summary = f"{aligned_count}/{len(pressure_by_interval)} source intervals aligned; {opposing_count} opposing; {retest_assessment}"
     return score, summary, details
@@ -2936,7 +3121,20 @@ def describe_snapshot(snap, cfg):
     rng = snap['range']
     last_candle = snap.get('candles') or []
     cndl = last_candle[-1]['pattern'] if last_candle else 'n/a'
+    expansion = 'n/a'
+    d = snap.get('df')
+    atr = snap.get('atr')
+    if d is not None and len(d) >= 3 and atr:
+        last_range = float(d['High'].iloc[-1] - d['Low'].iloc[-1])
+        prior_ranges = (pd.to_numeric(d['High'], errors='coerce') - pd.to_numeric(d['Low'], errors='coerce')).iloc[-21:-1]
+        median_range = float(prior_ranges.median()) if not prior_ranges.empty else 0.0
+        expansion = f"last range {last_range / atr:.2f} ATR, {last_range / median_range:.2f}x prior-20 median" if median_range > 0 else f"last range {last_range / atr:.2f} ATR"
+    swept = [p for p in snap['pivots'] if p.get('swept')][-2:]
+    sweep_text = ', '.join(
+        f"{p['type']} {_fmt(p['price'], cfg)} ({p.get('swept_at', 'time n/a')})" for p in swept
+    ) or 'none recently confirmed'
     return (f"structure={snap['trend']} ({snap['pattern']}), last break={brk}, EMA={snap['ema']['state']}, RSI={snap['rsi']}, last candle={cndl}, "
+            f"expansion evidence={expansion}, confirmed sweeps=[{sweep_text}], "
             f"unmitigated OBs=[{obs}], open FVGs=[{fvg}], live swing highs={[_fmt(x, cfg) for x in hs]}, live swing lows={[_fmt(x, cfg) for x in ls]}, "
             f"dealing range {_fmt(rng['low'], cfg)}-{_fmt(rng['high'], cfg)}")
 
@@ -2973,53 +3171,66 @@ def build_ai_audit_prompt(symbol, plan, bias, audit, snaps, cfg, live_price, dxy
     m10 = snaps.get('_micro_m10') or {}
     volume_frames = snaps.get('_volume_frames') or {}
     volume_lines = []
-    for label in ('M10', 'M15', 'M30', 'H1', 'H4'):
+    for label in ('M5', 'M10', 'M15', 'M30', 'H1', 'H4'):
         frame = volume_frames.get(label) or {}
         micro = frame.get('micro') or {}
         metrics = micro.get('volume_analysis') or {}
+        trade_delta = metrics.get('trade_delta') or {}
+        trade_delta_text = (
+            f"signed trade delta {trade_delta.get('delta_pct')}% across {trade_delta.get('trade_count')} prints/"
+            f"{trade_delta.get('covered_bars')} covered bars ({trade_delta.get('source')})"
+            if trade_delta.get('available') else f"signed trade delta unavailable ({trade_delta.get('source', 'no verified feed')})"
+        )
         if not metrics.get('available'):
-            volume_lines.append(f"{label}: unavailable")
+            volume_lines.append(f"{label}: OHLCV volume unavailable; {trade_delta_text}")
             continue
         profile = metrics.get('profile') or {}
+        hvn_text = ', '.join(
+            f"{_fmt(node['price'], cfg)} ({node['volume_share_pct']}% estimated profile share)"
+            for node in profile.get('hvn_levels', [])
+        ) or 'none identified'
         volume_lines.append(
-            f"{label} ({metrics.get('bar_minutes', '?')}m bars): global pressure {metrics.get('net_volume_proxy_side')} {metrics.get('net_volume_proxy_pct')}%, "
+            f"{label} ({metrics.get('bar_minutes', '?')}m bars; source {frame.get('instrument', 'unknown')}): global pressure proxy {metrics.get('net_volume_proxy_side')} {metrics.get('net_volume_proxy_pct')}%, "
             f"body pressure {metrics.get('body_pressure_pct')}%, OBV trend {metrics.get('obv_trend_pct')}%, CMF20 {metrics.get('cmf20_pct')}%, "
             f"MFI14 {metrics.get('mfi14')}, delta trend {metrics.get('delta_trend_pct')}%, RVOL {metrics.get('rvol')}, "
-            f"VWAP {micro.get('price_vs_vwap', 'n/a')}, POC/VAL/VAH {profile.get('poc')}/{profile.get('val')}/{profile.get('vah')}"
+            f"{trade_delta_text}, "
+            f"VWAP {micro.get('price_vs_vwap', 'n/a')}, POC/VAL/VAH {profile.get('poc')}/{profile.get('val')}/{profile.get('vah')}, estimated HVNs [{hvn_text}]"
         )
     m10_candles = snaps.get('_candles_m10') or []
     m10_pattern = m10_candles[-1]['pattern'] if m10_candles else 'n/a'
-    body = f"""You are the risk auditor of an institutional trading desk. A deterministic Python engine has ALREADY decided direction and exact levels using strict top-down analysis (H4/H1 decide direction; M30/M15 only refine the limit price inside the HTF zone). You may NOT change direction, entry, stop or target. Your job is to sanity-check the plan, use the chart screenshot if one is attached, flag concrete risks, and write a concise rationale.
+    structure_lines = '\n'.join(
+        f"{label}: {describe_snapshot(snaps.get(label), cfg)}"
+        for label in ('H4', 'H1', 'M30', 'M15', 'M10', 'M5')
+    )
+    body = f"""You are the cross-timeframe market-structure auditor. The deterministic Python engine has already ranked structural zones and locked one candidate plan. Synthesize the evidence from H4, H1, M30, M15, M10 and M5 into one coherent assessment of that exact candidate. Do not invent a second setup or change direction, entry, stop or target; the engine owns those levels. H4/H1 establish regime and directional context, M30/M15 locate the execution area, and M10/M5 assess timing. Do not let several noisy lower-timeframe signals outvote a confirmed higher-timeframe structure.
 
 SYMBOL: {symbol} | LIVE PRICE: {_fmt(live_price, cfg)}
 LOCKED PLAN: {plan['direction']} LIMIT | entry {_fmt(plan['entry'], cfg)} | SL {_fmt(plan['stop_loss'], cfg)} | TP1 {_fmt(plan['take_profit'][0], cfg)} ({plan['tp1_kind']}) | TP2 {_fmt(plan['take_profit'][1], cfg)} | R:R {plan['rr_ratio']}
 CHOSEN ZONE: {plan['zone']['kind']} {_fmt(plan['zone']['bottom'], cfg)}-{_fmt(plan['zone']['top'], cfg)}; confluence: {', '.join(plan['zone'].get('confluence') or []) or 'none'}; LTF refinement: {', '.join(plan.get('ltf_refs') or []) or 'none'}
 CHOSEN ZONE VOLUME CONFIRMATION: {json.dumps(plan.get('volume_confirmation') or {})}
 PYTHON SCORE: {plan['score']}/100 -> {json.dumps(plan['score_breakdown'])}
-QUALITY RULE: Always audit the best ranked executable candidate. H4/H1 alignment, structural entry/target, score, and agreement across volume indicators and distinct bar intervals affect its quality grade and risk warnings; they do not erase the candidate. Describe disagreements precisely and do not claim a calibrated probability or guaranteed outcome.
+QUALITY RULE: Audit the selected highest-ranked executable candidate and say whether the evidence is aligned, mixed, or materially conflicting. H4/H1 alignment, structural entry/target, score, and volume evidence affect its quality and risk warnings; never imply that the score is a calibrated probability. Missing or duplicated data is not confirmation. Price and volume are feed-specific; distinguish signed exchange prints from OHLCV pressure estimates.
 HTF BIAS ({bias['word']}, score {bias['score']:+.0f}): {' | '.join(bias['evidence'][:8])}. {' '.join(bias['notes'])}
-H4: {describe_snapshot(snaps.get('H4'), cfg)}
-H1: {describe_snapshot(snaps.get('H1'), cfg)}
-M30: {describe_snapshot(snaps.get('M30'), cfg)}
-M15: {describe_snapshot(snaps.get('M15'), cfg)}
+MULTI-TIMEFRAME STRUCTURE (closed candles only):
+{structure_lines}
 M10 MICRO: VWAP {m10.get('vwap', 'n/a')} | price vs VWAP {m10.get('price_vs_vwap', 'n/a')} | RVOL {m10.get('rvol', 'n/a')} | momentum {m10.get('momentum', 'n/a')} | last candle {m10_pattern}
 MULTI-TIMEFRAME VOLUME INDICATORS:
 {chr(10).join(volume_lines)}
-VOLUME DATA LIMIT: Candle-based pressure, OBV, MFI, and volume-at-price are OHLCV estimates, not exchange bid/ask delta or order-book depth. Bitfinex/Yahoo volume is feed/venue-specific, not consolidated market-wide volume. A POC/HVN is historical traded-volume concentration, not proof of a resting institutional buy/sell order or the identity of a participant. Interpret timeframe disagreement and missing/duplicated fallback intervals explicitly; do not claim verified aggressor-side flow.
+VOLUME DATA LIMIT: OHLCV pressure, OBV, MFI, and volume-at-price are estimates; the profile distributes each bar's volume uniformly across its high-low range. Signed Bitfinex prints are actual signed trades on that one venue only, never consolidated market-wide delta. Yahoo/OTC FX and index references may have no meaningful centralized volume. A POC/HVN is historical traded-volume concentration, not proof of resting orders or participant identity. Interpret missing intervals explicitly and do not call a proxy verified aggressor flow.
 KEY LEVELS: {lv}
 DXY: {dxy.get('detail')} -> relation to this trade: {dxy_rel}
 RANKED HTF ENTRY CANDIDATES:
 {chr(10).join(cand_lines) or 'none'}
 
 TASKS:
-1. Audit the selected plan against every timeframe and volume measure provided. State concrete conflicts and missing evidence; do not override the locked direction or levels and do not turn a candidate into a WAIT.
-2. Give score_adjustment between -6 and +6.
-3. List up to 3 specific risk_flags (empty list if none).
-4. next_level_watch: the next key HTF level beyond TP2 and why price may approach it.
-5. If a screenshot is attached, summarise visible support/resistance/liquidity in visual_levels; otherwise write "unavailable".
-6. Describe a re-entry only as a candidate range already supported by the ranked zones, such as a volume-POC retest. Never predict an exact future pullback or invent a price level; explicitly state that price may not retrace and the correct action can be to wait.
-Keep everything concise. Output complete valid JSON only (no markdown, no code fences):
-{{"agree": true, "score_adjustment": 0, "htf_bias_basis": "1-2 sentences", "ltf_entry_basis": "1-2 sentences", "risk_flags": [], "next_level_watch": "...", "visual_levels": "...", "microstructure_read": "...", "reasoning": "3-4 sentences: HTF thesis, why this zone, invalidation, target"}}"""
+1. Assign market_phase one of continuation, expansion, early_reversal, range, or mixed. Expansion requires a closed-bar range/structure break with participation evidence; do not label a lone spike an expansion.
+2. Assess early_reversal evidence using a confirmed liquidity sweep/rejection and opposing structure shift; treat an unconfirmed lower-timeframe reversal as a risk, not an H4/H1 bias flip.
+3. Give mtf_alignment as a concise H4-to-M5 synthesis. State conflicts and missing/duplicated inputs; do not use a simple timeframe vote.
+4. Audit the locked setup and assign agree=false only for a material structural conflict. Give score_adjustment between -6 and +6 and up to 3 specific risk_flags.
+5. Give htf_bias_basis, ltf_entry_basis, next_level_watch, visual_levels (or "unavailable" without a screenshot), microstructure_read, and a concise 3-4 sentence reasoning. Include invalidation and target context.
+6. Describe a re-entry only as a ranked candidate zone. Never invent prices, predict an exact pullback, or imply price must retrace.
+Output complete valid JSON only (no markdown, no code fences):
+{{"agree": true, "score_adjustment": 0, "market_phase": "mixed", "mtf_alignment": "...", "expansion_reversal_read": "...", "htf_bias_basis": "...", "ltf_entry_basis": "...", "risk_flags": [], "next_level_watch": "...", "visual_levels": "...", "microstructure_read": "...", "reasoning": "..."}}"""
     return body
 
 def build_telegram_signal_message(symbol, result):
@@ -3138,10 +3349,11 @@ def _finalize_result(symbol, plan, bias, audit, cfg, live_price, ai, dxy, dxy_re
     for label, frame in volume_frames.items():
         micro = frame.get('micro') or {}
         metrics = micro.get('volume_analysis') or {}
-        if metrics.get('available'):
+        trade_delta = metrics.get('trade_delta') or {}
+        if metrics.get('available') or trade_delta.get('available'):
             volume_analysis_by_tf[label] = {
                 **metrics, 'vwap': micro.get('vwap'), 'price_vs_vwap': micro.get('price_vs_vwap'),
-                'zone': zone_volume_by_tf.get(label, {})
+                'zone': zone_volume_by_tf.get(label, {}), 'instrument': frame.get('instrument', 'unknown')
             }
     result = {
         'symbol': symbol, 'signal': plan['direction'], 'bias': bias['word'],
@@ -3178,6 +3390,9 @@ def _finalize_result(symbol, plan, bias, audit, cfg, live_price, ai, dxy, dxy_re
                              f"Beyond TP2 the next liquidity to watch is the {'H4 range high' if plan['direction'] == 'BUY' else 'H4 range low'} at "
                              f"{_fmt((snaps.get('H4') or snaps.get('H1'))['range']['high' if plan['direction'] == 'BUY' else 'low'], cfg)}."),
         'htf_bias_basis': (ai.get('htf_bias_basis') if ai_used else None), 'ltf_entry_basis': (ai.get('ltf_entry_basis') if ai_used else None),
+        'market_phase': (ai.get('market_phase') if ai_used else (regime or {}).get('regime', 'mixed').lower()),
+        'mtf_alignment': (ai.get('mtf_alignment') if ai_used else None),
+        'expansion_reversal_read': (ai.get('expansion_reversal_read') if ai_used else None),
         'model_used': (ai.get('model_used') if ai_used else 'Python structure engine (AI auditor unavailable)'),
         'api_status': (ai.get('api_status') if ai_used else 'ENGINE_ONLY'),
         'total_tokens': (ai.get('total_tokens', 0) if ai else 0), 'prompt_tokens': (ai.get('prompt_tokens', 0) if ai else 0),
@@ -3243,25 +3458,42 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
         # ── 1. Structural snapshots (CLOSED candles only) ────────────────────────────
         h1_raw = data.get('H1', pd.DataFrame())
         h4_raw = ensure_h4(h1_raw, data.get('H4', pd.DataFrame()))
+        m5_closed = closed_candles(data.get('M5', pd.DataFrame()))
+        m10_closed = closed_candles(m10)
         snaps = {
             'H4': analyze_structure(h4_raw, 'H4', left=2, right=2, leg_atr=1.0, ob_disp_atr=cfg['ob_disp_atr'], fvg_min_atr=cfg['fvg_min_atr'], liq_tol_atr=cfg['liq_tol_atr']),
             'H1': analyze_structure(h1_raw, 'H1', left=3, right=3, leg_atr=1.0, ob_disp_atr=cfg['ob_disp_atr'], fvg_min_atr=cfg['fvg_min_atr'], liq_tol_atr=cfg['liq_tol_atr']),
             'M30': analyze_structure(data.get('M30'), 'M30', left=3, right=3, leg_atr=0.8, ob_disp_atr=cfg['ob_disp_atr'], fvg_min_atr=cfg['fvg_min_atr'], liq_tol_atr=cfg['liq_tol_atr']),
             'M15': analyze_structure(data.get('M15'), 'M15', left=3, right=3, leg_atr=0.8, ob_disp_atr=cfg['ob_disp_atr'], fvg_min_atr=cfg['fvg_min_atr'], liq_tol_atr=cfg['liq_tol_atr']),
+            'M10': analyze_structure(m10_closed, 'M10', left=3, right=3, leg_atr=0.7, ob_disp_atr=cfg['ob_disp_atr'], fvg_min_atr=cfg['fvg_min_atr'], liq_tol_atr=cfg['liq_tol_atr']),
+            'M5': analyze_structure(m5_closed, 'M5', left=3, right=3, leg_atr=0.6, ob_disp_atr=cfg['ob_disp_atr'], fvg_min_atr=cfg['fvg_min_atr'], liq_tol_atr=cfg['liq_tol_atr']),
         }
-        m10_closed = closed_candles(m10)
         snaps['_micro_m10'] = calculate_microstructure(m10_closed)
         snaps['_candles_m10'] = classify_candles(m10_closed)
-        volume_frames = {'M10': {'df': m10_closed, 'micro': snaps['_micro_m10']}}
-        for label, raw_frame in (('M15', data.get('M15')), ('M30', data.get('M30')), ('H1', h1_raw), ('H4', h4_raw)):
+        volume_frames = {}
+        trade_flow = data.get('TRADE_FLOW', pd.DataFrame(columns=['signed_amount', 'price']))
+        frame_data = (
+            ('M5', data.get('M5')), ('M10', m10_closed), ('M15', data.get('M15')),
+            ('M30', data.get('M30')), ('H1', h1_raw), ('H4', h4_raw),
+        )
+        for label, raw_frame in frame_data:
             if raw_frame is None or raw_frame.empty:
                 continue
             structural_snap = snaps.get(label)
-            closed_frame = structural_snap['df'] if structural_snap else closed_candles(raw_frame)
+            closed_frame = structural_snap['df'] if structural_snap and structural_snap.get('df') is not None else closed_candles(raw_frame)
+            micro = (structural_snap or {}).get('micro') or calculate_microstructure(closed_frame)
+            metrics = dict(micro.get('volume_analysis') or {})
+            metrics['trade_delta'] = calculate_trade_delta_analysis(trade_flow, closed_frame)
+            micro = {**micro, 'volume_analysis': metrics}
             volume_frames[label] = {
                 'df': closed_frame,
-                'micro': (structural_snap or {}).get('micro') or calculate_microstructure(closed_frame),
+                'micro': micro,
+                'trade_flow': trade_flow,
+                'instrument': raw_frame.attrs.get('market_data_instrument') or _market_instrument_label(
+                    symbol, raw_frame.attrs.get('market_data_provider', 'unknown')
+                ),
             }
+        snaps['_micro_m10'] = (volume_frames.get('M10') or {}).get('micro') or snaps['_micro_m10']
         snaps['_volume_frames'] = volume_frames
         if not snaps['H1']:
             return {"error": f"Not enough closed H1 history for {symbol} to build a reliable higher-timeframe structure. Try again shortly."}
@@ -3354,10 +3586,11 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
                 for timeframe, frame in (snaps.get('_volume_frames') or {}).items():
                     micro = frame.get('micro') or {}
                     metrics = micro.get('volume_analysis') or {}
-                    if metrics.get('available'):
+                    trade_delta = metrics.get('trade_delta') or {}
+                    if metrics.get('available') or trade_delta.get('available'):
                         zone_metrics = (result['volume_confirmation'].get('timeframes') or {}).get(timeframe, {})
                         result['volume_analysis_by_tf'][timeframe] = {
-                            **metrics, 'vwap': micro.get('vwap'),
+                            **metrics, 'vwap': micro.get('vwap'), 'instrument': frame.get('instrument', 'unknown'),
                             'price_vs_vwap': micro.get('price_vs_vwap'), 'zone': zone_metrics
                         }
                 result['volume_analysis'] = ((snaps.get('H1') or {}).get('micro') or {}).get('volume_analysis') or {}
@@ -3718,7 +3951,7 @@ def render_liquidity_context(result, cfg):
             st.dataframe(pd.DataFrame(pool_rows), hide_index=True, use_container_width=True)
         else:
             st.caption('No unswept swing or equal-high/low pools were found beyond the current price.')
-        st.caption("Volume is estimated from OHLCV candles; it cannot reveal actual bid/ask aggressor volume or verify institutional orders.")
+        st.caption("Candle volume and pressure are feed-specific estimates. Signed trade delta is shown only when the source provides timestamped, signed public trades; it remains venue-specific and is not consolidated market flow.")
 
 def render_signal_card(symbol, result, all_data):
     cfg = get_pair_config(symbol)
@@ -3731,7 +3964,7 @@ def render_signal_card(symbol, result, all_data):
         st.write(f"**Candidate score:** {result.get('confluence_score', 0)}/100 · **HTF bias:** {(result.get('htf_bias') or {}).get('word', 'n/a')} · **Volume evidence:** {(result.get('volume_confirmation') or {}).get('retest_assessment', 'n/a')}")
         entry_candidates = result.get('entry_candidates') or []
         if entry_candidates:
-            st.caption("Watch-only levels, not executable signals. Wait for price action confirmation; the volume split below is an OHLCV estimate.")
+            st.caption("Watch-only levels, not executable signals. Wait for price action confirmation; OHLCV volume splits are estimates.")
             st.dataframe(pd.DataFrame([{
                 'Side': item.get('direction'),
                 'Zone': item.get('kind'),
@@ -3787,6 +4020,9 @@ def render_signal_card(symbol, result, all_data):
     if result.get('quality_warnings'):
         st.warning('⚠️ Setup quality: ' + '; '.join(result['quality_warnings']))
     st.write(f"**DXY correlation:** {result.get('dxy_correlation', 'N/A')} · **Regime (H1):** {result.get('regime', 'n/a')} · **Microstructure:** {result.get('microstructure_read', 'N/A')}")
+    st.write(f"**AI market phase:** {result.get('market_phase', 'n/a')} · **Multi-timeframe read:** {result.get('mtf_alignment') or 'AI synthesis unavailable'}")
+    if result.get('expansion_reversal_read'):
+        st.caption(f"Expansion / reversal evidence: {result['expansion_reversal_read']}")
     with st.expander('📊 Volume profile & pressure evidence'):
         volume_by_tf = result.get('volume_analysis_by_tf') or {}
         confirmation = result.get('volume_confirmation') or {}
@@ -3809,18 +4045,25 @@ def render_signal_card(symbol, result, all_data):
                 f"{confirmation.get('sell_volume_proxy_pct', 'n/a')}%"
             )
             volume_rows = []
-            for timeframe in ('M10', 'M15', 'M30', 'H1', 'H4'):
+            for timeframe in ('M5', 'M10', 'M15', 'M30', 'H1', 'H4'):
                 metrics = volume_by_tf.get(timeframe)
                 if not metrics:
                     continue
                 zone_metrics = metrics.get('zone') or {}
                 profile = metrics.get('profile') or {}
+                trade_delta = metrics.get('trade_delta') or {}
                 volume_rows.append({
-                    'TF': timeframe, 'Bar min': metrics.get('bar_minutes'),
+                    'TF': timeframe, 'Bar min': metrics.get('bar_minutes'), 'Candle source': metrics.get('instrument', 'unknown'),
                     'TF pressure': metrics.get('net_volume_proxy_side'),
-                    'TF delta %': metrics.get('net_volume_proxy_pct'),
+                    'TF OHLCV delta proxy %': metrics.get('net_volume_proxy_pct'),
+                    'Reported trade delta %': trade_delta.get('delta_pct') if trade_delta.get('available') else 'n/a',
+                    'Trade prints / bars': f"{trade_delta.get('trade_count', 0)} / {trade_delta.get('covered_bars', 0)}" if trade_delta.get('available') else 'n/a',
+                    'Estimated HVNs': ', '.join(_fmt(node['price'], cfg) for node in profile.get('hvn_levels', [])) or 'n/a',
                     'Zone control': zone_metrics.get('zone_control', 'n/a'),
-                    'Zone delta %': zone_metrics.get('zone_delta_proxy_pct'),
+                    'Zone delta % (reported if available)': zone_metrics.get('zone_delta_proxy_pct'),
+                    'Zone delta source': zone_metrics.get('zone_delta_source', 'OHLCV estimate'),
+                    'Participation': zone_metrics.get('zone_volume_intensity', 'n/a'),
+                    'Zone volume share %': zone_metrics.get('zone_volume_share_pct'),
                     'Buy volume proxy %': zone_metrics.get('buy_volume_proxy_pct'),
                     'Sell volume proxy %': zone_metrics.get('sell_volume_proxy_pct'),
                     'Reject vol %': zone_metrics.get('directional_rejection_volume_pct'),
@@ -3835,7 +4078,7 @@ def render_signal_card(symbol, result, all_data):
                     'Value area': zone_metrics.get('profile_relation', 'n/a'),
                 })
             st.dataframe(pd.DataFrame(volume_rows), hide_index=True, use_container_width=True)
-            st.caption('Zone control combines candle-pressure, body-volume, OBV, CMF and MFI proxies. Pullback/impulse volume below 1 suggests weaker countertrend candle volume; above 1 suggests stronger countertrend participation. Rejection measures volume on candles closing beyond the zone in the intended direction. Profiles and pressure are OHLCV and feed/venue-specific estimates, not consolidated market volume, bid/ask trade delta, or proof of resting institutional orders.')
+            st.caption('OHLCV pressure, OBV, CMF, MFI and buy/sell splits are estimates; reported delta uses signed exchange prints only when timestamp coverage is adequate and applies to that venue alone. Zone profiles distribute candle volume uniformly across each high-low range. No feed here represents consolidated OTC FX or index flow, and none verifies resting institutional orders.')
         else:
             st.info('Usable volume data is unavailable for this feed; volume was treated as neutral in candidate scoring.')
     if result.get('order_description'):
